@@ -1,0 +1,144 @@
+name: Draft Open
+
+# The app opens a draft pull request on the first push of a ceremony branch
+# that passes the deterministic checks (docs/specs/review-ceremony, Draft by
+# the App, Ready by the Owner). The Quality workflow runs on the pushed head,
+# and this workflow re-enters when it completes, so one push builds once. The
+# draft carries the session's ceremony body from
+# docs/changes/<id>/pull-request.md when the branch has one, else a
+# placeholder body that passes schemas/PULL_REQUEST.mdschema
+# (tests/draft-open-body proves the placeholder). A branch that ever had a
+# pull request gets no second draft. Nothing here flips a draft to ready:
+# that is the owner's `rune sign open`. The runewright token is minted for
+# the create call alone, so the pull request opens under the app identity.
+#
+# workflow_run fires from the default branch with a write-capable token, so
+# nothing from the pushed head executes here: the head is checked out to read
+# one markdown file, and `persist-credentials` stays off.
+on:
+    workflow_run:
+        workflows: [Quality]
+        types: [completed]
+        branches:
+            - "change/**"
+            - "codex/**"
+            - "fable/**"
+
+permissions: {}
+
+# Two pushes to one branch in quick succession must not race to two
+# drafts. The group serializes them and the second finds the first's draft.
+concurrency:
+    group: draft-open-${{ github.event.workflow_run.head_branch }}
+    cancel-in-progress: false
+
+jobs:
+    existing:
+        # Only a green push run of the same repository opens a draft. A fork's
+        # push runs in the fork, so its runs never arrive here.
+        if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository
+        runs-on: ubuntu-latest
+        timeout-minutes: 2
+        permissions:
+            pull-requests: read
+        outputs:
+            found: ${{ steps.existing.outputs.found }}
+        steps:
+            - name: Find an existing pull request
+              id: existing
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  REPOSITORY: ${{ github.repository }}
+                  OWNER: ${{ github.repository_owner }}
+                  BRANCH: ${{ github.event.workflow_run.head_branch }}
+              run: |
+                  set -o pipefail
+                  # state=all: a closed or merged pull request also spends
+                  # the branch's first push. Pages merge through jq -s.
+                  count=$(gh api --paginate "repos/$REPOSITORY/pulls?state=all&head=$OWNER:$BRANCH&per_page=100" \
+                      --jq '[.[].number]' | jq -s 'add // [] | length') \
+                      || { echo "could not read the pull requests for $BRANCH; rerun the workflow"; exit 1; }
+                  if [ "$count" != "0" ]; then
+                      echo "found=true" >> "$GITHUB_OUTPUT"
+                      echo "$BRANCH already has a pull request, so no second draft opens."
+                  else
+                      echo "found=false" >> "$GITHUB_OUTPUT"
+                  fi
+
+    open:
+        needs: existing
+        if: needs.existing.outputs.found == 'false'
+        runs-on: ubuntu-latest
+        timeout-minutes: 3
+        permissions:
+            contents: read
+            pull-requests: read
+        steps:
+            # The proven head, read for one file. Nothing in it runs.
+            - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+              with:
+                  ref: ${{ github.event.workflow_run.head_sha }}
+                  persist-credentials: false
+
+            - name: Compose the body
+              id: body
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  REPOSITORY: ${{ github.repository }}
+                  BRANCH: ${{ github.event.workflow_run.head_branch }}
+                  HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+              run: |
+                  set -euo pipefail
+                  change_id=${BRANCH#*/}
+                  title=$(gh api "repos/$REPOSITORY/commits/$HEAD_SHA" --jq '.commit.message' | head -n 1)
+                  [ -n "$title" ] || title="Draft: $BRANCH"
+                  body="$RUNNER_TEMP/pull-request.md"
+                  if [ -f "docs/changes/$change_id/pull-request.md" ]; then
+                      cp "docs/changes/$change_id/pull-request.md" "$body"
+                      echo "body from docs/changes/$change_id/pull-request.md"
+                  else
+                      cat > "$body" <<EOF
+                  Draft for \`$BRANCH\`: the session agent fills this body before \`rune sign open\`.
+
+                  ## Plan
+
+                  Why this shape, one or two sentences.
+
+                  ## Changes
+
+                  - Fill in: verb-first, file-anchored claims the diff upholds.
+
+                  ## Testing
+
+                  - [ ] Fill in: the command run and its outcome.
+
+                  ## Release Notes
+
+                  - N/A
+                  EOF
+                      echo "body from the placeholder template"
+                  fi
+                  printf 'title=%s\n' "$title" >> "$GITHUB_OUTPUT"
+                  printf 'body=%s\n' "$body" >> "$GITHUB_OUTPUT"
+
+            - id: runewright
+              uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+              with:
+                  app-id: ${{ secrets.RUNEWRIGHT_APP_ID }}
+                  private-key: ${{ secrets.RUNEWRIGHT_APP_KEY }}
+                  permission-contents: read
+                  permission-pull-requests: write
+
+            - name: Open the draft
+              env:
+                  GH_TOKEN: ${{ steps.runewright.outputs.token }}
+                  REPOSITORY: ${{ github.repository }}
+                  DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+                  BRANCH: ${{ github.event.workflow_run.head_branch }}
+                  TITLE: ${{ steps.body.outputs.title }}
+                  BODY: ${{ steps.body.outputs.body }}
+              run: |
+                  set -euo pipefail
+                  gh pr create --repo "$REPOSITORY" --draft \
+                      --base "$DEFAULT_BRANCH" --head "$BRANCH" \
+                      --title "$TITLE" --body-file "$BODY"

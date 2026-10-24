@@ -1,0 +1,182 @@
+#!/bin/bash
+# rust-cache: keep cargo build folders from growing without bound. The
+# Homebrew service (brew services start n4m3z/tap/rust-cache) runs it every
+# night at 04:00. Run it by hand with --dry-run to see what it would free.
+#
+# Every cargo build folder under the roots (default ~/Developer and ~/Agents)
+# gets four passes:
+#   objects      macOS debug builds keep the object files of each link for
+#                debug info (split-debuginfo=unpacked). From Rust 1.88 every
+#                compile gives them new names, so the old ones stay forever
+#                (rust-lang/rust#161824). The debug map of a binary (nm OSO)
+#                names the objects it uses. An object of that binary that the
+#                map does not name and that is older than the binary goes.
+#                Objects newer than the binary belong to a compile in progress
+#                and stay.
+#   toolchains   cargo sweep --installed: output of rustc versions that are no
+#                longer installed. Each Homebrew rust upgrade orphans all of it.
+#   age          cargo sweep --time DAYS: artifacts whose fingerprint nobody
+#                read in DAYS days.
+#   incremental  incremental caches not written in DAYS days. cargo-sweep
+#                never touches them.
+# A build folder that a link in ~/.local/bin points into skips both sweeps:
+# cargo-sweep would delete the installed release binary.
+#
+# Usage: rust-cache [--dry-run] [--days N] [ROOT...]
+# Exit 0 on success, 64 on a bad argument, 69 when a tool is missing, 75 when
+# another run holds the lock.
+# Source: https://github.com/N4M3Z/rust-cache
+set -u
+export LC_ALL=C
+PATH="$HOME/.local/bin:/opt/homebrew/bin:$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+dry_run=""
+days=7
+while [ $# -gt 0 ]; do
+    case $1 in
+        --dry-run) dry_run=1 ;;
+        --days)
+            [[ ${2:-} =~ ^[0-9]+$ ]] || { echo "rust-cache: --days needs a number" >&2; exit 64; }
+            days=$2
+            shift
+            ;;
+        -h | --help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
+        -*) echo "rust-cache: unknown option $1" >&2; exit 64 ;;
+        *) break ;;
+    esac
+    shift
+done
+[ $# -gt 0 ] || set -- "$HOME/Developer" "$HOME/Agents"
+
+for tool in fd jq nm cargo cargo-sweep; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "rust-cache: $tool not found" >&2; exit 69; }
+done
+
+# ~/Library/Caches is writable from the agent sandbox, so a sandboxed run and
+# the launch agent share one lock. A lock older than a day is from a run that
+# was killed.
+lock="$HOME/Library/Caches/rust-cache.lock"
+find "$lock" -maxdepth 0 -mtime +0 -exec rmdir {} \; 2>/dev/null
+mkdir "$lock" 2>/dev/null || { echo "rust-cache: another run holds $lock" >&2; exit 75; }
+trap 'rmdir "$lock"' EXIT
+
+gib() { awk -v k="$1" 'BEGIN { printf "%.2f GiB", k / 1048576 }'; }
+
+# Reads paths, one per line. Prints the KiB they hold, then deletes them
+# unless this is a dry run.
+remove() {
+    local list
+    list=$(cat)
+    if [ -z "$list" ]; then
+        echo 0
+        return
+    fi
+    printf '%s\n' "$list" | tr '\n' '\0' | xargs -0 du -sk | awk '{ s += $1 } END { print s + 0 }'
+    [ -n "$dry_run" ] || printf '%s\n' "$list" | tr '\n' '\0' | xargs -0 rm -rf
+}
+
+# Cargo writes CACHEDIR.TAG at the top of every build folder it creates. A
+# folder inside another one is listed once, as its outermost folder.
+build_folders() {
+    fd -H -I -t f -g CACHEDIR.TAG -E node_modules -E .git -E .jj "$@" \
+        | while IFS= read -r tag; do
+            grep -q cargo "$tag" && dirname "$tag"
+        done \
+        | sort -u \
+        | awk 'NR == 1 || index($0, prev "/") != 1 { print; prev = $0 }'
+}
+
+# An incremental compile names its objects <crate>-<hash>.<unit>.<compile>.rcgu.o
+# with a new 7-character <compile> token each time. Other compiles use fixed
+# names (<unit>-cgu.<n>.rcgu.o) that the next compile overwrites, so the token
+# pattern alone selects candidates. Per crate, the newest compile stays, and
+# so does every compile that the debug map of the crate's binary or dylib
+# names. Only objects older than the crate's output (binary, dylib, or rlib)
+# qualify, so a compile in progress keeps its own. Debug maps of other
+# binaries point into the rlib archive, not at these files.
+token_objects() {
+    find "$1" -maxdepth 1 -type f -name "$2.*.rcgu.o" "${@:3}" 2>/dev/null | grep -E '\.[0-9a-z]{7}\.rcgu\.o$'
+}
+
+stale_objects() {
+    local dir stem output anchor refs keep
+    find "$1" -type f -name '*.rcgu.o' 2>/dev/null | grep -E '\.[0-9a-z]{7}\.rcgu\.o$' | sed -E 's#/[^/]+$##' | sort -u | while IFS= read -r dir; do
+        token_objects "$dir" '*' | sed -E 's#^.*/([^/.]+)\.[^/]*$#\1#' | sort -u | while IFS= read -r stem; do
+            anchor=""
+            for output in "$dir/$stem" "$dir/lib$stem.dylib" "$dir/lib$stem.rlib"; do
+                if [ -f "$output" ]; then
+                    anchor=$output
+                    break
+                fi
+            done
+            [ -n "$anchor" ] || continue
+            refs=""
+            if [ "$anchor" != "$dir/lib$stem.rlib" ]; then
+                refs=$(nm -ap "$anchor" 2>/dev/null | awk '/ OSO / { sub(/^.* OSO /, ""); print }' | grep -F "$dir/$stem.")
+                # A binary that names none of its own objects was not built
+                # with unpacked debug info, or its paths differ from ours.
+                [ -n "$refs" ] || continue
+            fi
+            keep=$({
+                token_objects "$dir" "$stem" | tr '\n' '\0' | xargs -0 stat -f '%m %N' | sort -rn | head -1 | cut -d' ' -f2-
+                [ -z "$refs" ] || printf '%s\n' "$refs"
+            } | awk -F. '{ print $(NF - 2) }' | sort -u)
+            token_objects "$dir" "$stem" ! -newer "$anchor" \
+                | KEEP=$keep awk -F. 'BEGIN { n = split(ENVIRON["KEEP"], k, "\n"); for (i = 1; i <= n; i++) K[k[i]] = 1 } !($(NF - 2) in K)'
+        done
+    done
+}
+
+stale_incremental() {
+    find "$1" -maxdepth 4 -type d -name incremental -prune | while IFS= read -r dir; do
+        find "$dir" -mindepth 1 -maxdepth 1 -type d -mtime +"$days"
+    done
+}
+
+# Runs from the project folder, so cargo reads the same .cargo/config.toml
+# files as a build there, and only when that project builds into this folder.
+sweep() {
+    local folder=$1 project resolved
+    project=$(dirname "$folder")
+    if [ ! -f "$project/Cargo.toml" ]; then
+        echo "  sweep skipped: no Cargo.toml beside the build folder"
+        return
+    fi
+    resolved=$(cd "$project" && cargo metadata --no-deps --offline --format-version 1 2>/dev/null | jq -r .target_directory)
+    if [ "$resolved" != "$folder" ]; then
+        echo "  sweep skipped: $project builds into ${resolved:-an unknown folder}"
+        return
+    fi
+    (cd "$project" && cargo sweep ${dry_run:+--dry-run} --installed . && cargo sweep ${dry_run:+--dry-run} --time "$days" .) 2>&1 | sed 's/^/  /'
+}
+
+protected=$(for link in "$HOME"/.local/bin/*; do [ -L "$link" ] && readlink -f "$link"; done)
+folders=$(build_folders "$@")
+[ -n "$folders" ] || { echo "rust-cache: no cargo build folders under $*"; exit 0; }
+
+echo "rust-cache $(date '+%Y-%m-%d %H:%M')${dry_run:+ (dry run)}, $days days, roots: $*"
+before=$(printf '%s\n' "$folders" | tr '\n' '\0' | xargs -0 du -sk | awk '{ s += $1 } END { print s + 0 }')
+
+# The listed sizes are upper bounds: rustc hard-links some objects from the
+# incremental cache, and deleting one of two links frees nothing. The folder
+# sizes after a real run are the measured result.
+printf '%s\n' "$folders" | while IFS= read -r folder; do
+    echo "$folder"
+    size=$(du -sk "$folder" | cut -f1)
+    objects=$(stale_objects "$folder" | remove)
+    incremental=$(stale_incremental "$folder" | remove)
+    echo "  listed: objects $(gib "$objects"), incremental $(gib "$incremental")"
+    if printf '%s\n' "$protected" | grep -qF "$folder/"; then
+        echo "  sweep skipped: an installed binary in ~/.local/bin links into this folder"
+    else
+        sweep "$folder"
+    fi
+    [ -n "$dry_run" ] || echo "  size: $(gib "$size") before, $(gib "$(du -sk "$folder" | cut -f1)") after"
+done
+
+if [ -n "$dry_run" ]; then
+    echo "total before: $(gib "$before") (dry run, nothing deleted)"
+else
+    after=$(printf '%s\n' "$folders" | while IFS= read -r f; do [ -d "$f" ] && printf '%s\0' "$f"; done | xargs -0 du -sk | awk '{ s += $1 } END { print s + 0 }')
+    echo "total before: $(gib "$before"), after: $(gib "$after")"
+fi

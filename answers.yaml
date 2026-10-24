@@ -1,0 +1,7 @@
+# Changes here will be overwritten by Copier; never edit manually.
+BRIEF: Prune stale cargo build output every night, including leftover macOS debug objects
+NAME: rust-cache
+OWNER: N4M3Z
+TITLE: Rust Cache
+_commit: c917df5debc2d92541d32ad6b3ee3bdd5469a742
+_src_path: https://github.com/runedeck/skeleton.git
