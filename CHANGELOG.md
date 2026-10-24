@@ -4,6 +4,12 @@ All notable changes to Rust Cache are documented here, following [Keep a Changel
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-25
+
+### Added
+
+- Add the idle pass, which removes a build folder that nothing wrote or read for 14 days (`--idle-days`).
+
 ## [0.1.0] - 2026-10-24
 
 ### Added

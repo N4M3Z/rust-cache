@@ -21,22 +21,25 @@ The service runs at 04:00. launchd runs a missed time once after the Mac wakes. 
 
 ```sh
 rust-cache --help
-rust-cache --dry-run              # show what each folder would free
-rust-cache --days 14 ~/Projects   # other age and roots
+rust-cache --dry-run                   # show what each folder would free
+rust-cache --days 14 ~/Projects        # other age and roots
+rust-cache --idle-days 30 ~/Projects   # keep idle folders longer
 ```
 
-Every cargo build folder under the roots (default `~/Developer` and `~/Agents`) gets four passes:
+Every cargo build folder under the roots (default `~/Developer` and `~/Agents`) gets five passes:
 
 | Pass | Removes |
 |------|---------|
+| idle | The whole folder, when nothing in it was written and no fingerprint read for 14 days. |
 | objects | Object files that the binary's debug map does not name and that are older than the binary. |
 | toolchains | `cargo sweep --installed`: output of rustc versions that are no longer installed. |
 | age | `cargo sweep --time 7`: artifacts nobody read in 7 days. |
 | incremental | Incremental caches not written in 7 days. cargo-sweep never touches them. |
 
-The objects pass keeps any object newer than its binary, so a compile in progress keeps its own. A build
-folder that a link in `~/.local/bin` points into skips both sweeps, because cargo-sweep would delete the
-installed release binary.
+The objects pass keeps any object newer than its binary, so a compile in progress keeps its own. The idle
+pass costs at most one full rebuild of a folder nobody built in two weeks. A build folder that a link in
+`~/.local/bin` points into skips both sweeps and is never removed whole, because those passes would delete
+the installed release binary.
 
 ## Requirements
 

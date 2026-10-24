@@ -4,7 +4,11 @@
 # night at 04:00. Run it by hand with --dry-run to see what it would free.
 #
 # Every cargo build folder under the roots (default ~/Developer and ~/Agents)
-# gets four passes:
+# gets five passes:
+#   idle         a folder in which nothing was written, and no fingerprint
+#                read, for IDLE days (default 14) goes whole. A build writes
+#                its outputs and fingerprints, so the cost of a mistake is
+#                one full rebuild. The other passes skip a removed folder.
 #   objects      macOS debug builds keep the object files of each link for
 #                debug info (split-debuginfo=unpacked). From Rust 1.88 every
 #                compile gives them new names, so the old ones stay forever
@@ -19,10 +23,10 @@
 #                read in DAYS days.
 #   incremental  incremental caches not written in DAYS days. cargo-sweep
 #                never touches them.
-# A build folder that a link in ~/.local/bin points into skips both sweeps:
-# cargo-sweep would delete the installed release binary.
+# A build folder that a link in ~/.local/bin points into skips both sweeps
+# and is never removed whole: those passes would delete the installed binary.
 #
-# Usage: rust-cache [--dry-run] [--days N] [ROOT...]
+# Usage: rust-cache [--dry-run] [--days N] [--idle-days N] [ROOT...]
 # Exit 0 on success, 64 on a bad argument, 69 when a tool is missing, 75 when
 # another run holds the lock.
 # Source: https://github.com/N4M3Z/rust-cache
@@ -32,12 +36,18 @@ PATH="$HOME/.local/bin:/opt/homebrew/bin:$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbi
 
 dry_run=""
 days=7
+idle_days=14
 while [ $# -gt 0 ]; do
     case $1 in
         --dry-run) dry_run=1 ;;
         --days)
             [[ ${2:-} =~ ^[0-9]+$ ]] || { echo "rust-cache: --days needs a number" >&2; exit 64; }
             days=$2
+            shift
+            ;;
+        --idle-days)
+            [[ ${2:-} =~ ^[1-9][0-9]*$ ]] || { echo "rust-cache: --idle-days needs a number above 0" >&2; exit 64; }
+            idle_days=$2
             shift
             ;;
         -h | --help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
@@ -127,6 +137,15 @@ stale_objects() {
     done
 }
 
+# Idle: no file written and no fingerprint read in IDLE days. cargo reads its
+# fingerprints on every build. macOS records a read only once after each
+# write, and this script never reads fingerprints (cargo-sweep only reads
+# them once after a write), so the read times stay a fair signal.
+idle() {
+    [ -z "$(find "$1" -mtime -"$idle_days" -print -quit 2>/dev/null)" ] \
+        && [ -z "$(find "$1" -path '*/.fingerprint/*' -atime -"$idle_days" -print -quit 2>/dev/null)" ]
+}
+
 stale_incremental() {
     find "$1" -maxdepth 4 -type d -name incremental -prune | while IFS= read -r dir; do
         find "$dir" -mindepth 1 -maxdepth 1 -type d -mtime +"$days"
@@ -154,7 +173,7 @@ protected=$(for link in "$HOME"/.local/bin/*; do [ -L "$link" ] && readlink -f "
 folders=$(build_folders "$@")
 [ -n "$folders" ] || { echo "rust-cache: no cargo build folders under $*"; exit 0; }
 
-echo "rust-cache $(date '+%Y-%m-%d %H:%M')${dry_run:+ (dry run)}, $days days, roots: $*"
+echo "rust-cache $(date '+%Y-%m-%d %H:%M')${dry_run:+ (dry run)}, $days days, idle $idle_days days, roots: $*"
 before=$(printf '%s\n' "$folders" | tr '\n' '\0' | xargs -0 du -sk | awk '{ s += $1 } END { print s + 0 }')
 
 # The listed sizes are upper bounds: rustc hard-links some objects from the
@@ -162,6 +181,13 @@ before=$(printf '%s\n' "$folders" | tr '\n' '\0' | xargs -0 du -sk | awk '{ s +=
 # sizes after a real run are the measured result.
 printf '%s\n' "$folders" | while IFS= read -r folder; do
     echo "$folder"
+    if ! printf '%s\n' "$protected" | grep -qF "$folder/" && idle "$folder"; then
+        freed=$(printf '%s\n' "$folder" | remove)
+        verb=removed
+        [ -z "$dry_run" ] || verb="would remove"
+        echo "  idle for $idle_days days: $verb the whole folder, $(gib "$freed")"
+        continue
+    fi
     size=$(du -sk "$folder" | cut -f1)
     objects=$(stale_objects "$folder" | remove)
     incremental=$(stale_incremental "$folder" | remove)
